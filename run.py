@@ -45,6 +45,19 @@ def main():
     )
 
     parser.add_argument(
+        '--baudrate',
+        type=int,
+        default=115200,
+        help='Baudrate for COM-ports (default: 115200)'
+    )
+
+    parser.add_argument(
+        '--rtscts',
+        action='store_true',
+        help='Enable hardware flow control for COM-ports'
+    )
+
+    parser.add_argument(
         '--ml',
         action='store_true',
         help='Enable the Sensing tab for ML-based features'
@@ -102,8 +115,8 @@ def main():
 
     if args.uart:
         print("Mode: Reading from COM-ports")
-        initiator_source = UartDataSource(args.initiator, baudrate=1000000)
-        reflector_source = UartDataSource(args.reflector, baudrate=1000000)
+        initiator_source = UartDataSource(args.initiator, baudrate=args.baudrate, rtscts=args.rtscts)
+        reflector_source = UartDataSource(args.reflector, baudrate=args.baudrate, rtscts=args.rtscts)
 
         initiator_source.set_stop_event(stop_event)
         reflector_source.set_stop_event(stop_event)

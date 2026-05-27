@@ -1,3 +1,14 @@
+/ {
+	cs_antenna_switch: cs-antenna-config {
+		status = "okay";
+		compatible = "nordic,bt-cs-antenna-switch";
+		/* P2.05 = rfsw-ctl (antenna select), P2.03 = rfsw-pwr (switch power) */
+		ant-gpios = <&gpio2 5 GPIO_ACTIVE_LOW>,
+					<&gpio2 3 GPIO_ACTIVE_HIGH>;
+		multiplexing-mode = <0>;
+	};
+};
+
 &uart20 {
 	current-speed = <1000000>;
 	hw-flow-control;

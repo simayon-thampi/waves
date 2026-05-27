@@ -8,12 +8,21 @@
 #include <zephyr/bluetooth/cs.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/console/console.h>
-#include <dk_buttons_and_leds.h>
+#include <zephyr/drivers/gpio.h>
+
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+
+static inline int dk_leds_init(void) {
+    if (!gpio_is_ready_dt(&led0)) return -ENODEV;
+    return gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
+}
+static inline void dk_set_led_on(uint8_t led)  { gpio_pin_set_dt(&led0, 1); }
+static inline void dk_set_led_off(uint8_t led) { gpio_pin_set_dt(&led0, 0); }
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
-#define CON_STATUS_LED DK_LED1
+#define CON_STATUS_LED 0
 #define CS_CONFIG_ID   0
 
 static K_SEM_DEFINE(sem_connected, 0, 1);
@@ -194,12 +203,15 @@ int main(void)
 
 	LOG_INF("Starting Simple Channel Sounding Reflector Sample");
 
-	dk_leds_init();
-
 	err = bt_enable(NULL);
 	if (err) {
 		LOG_ERR("Bluetooth init failed (err %d)", err);
 		return 0;
+	}
+
+	err = dk_leds_init();
+	if (err) {
+		LOG_ERR("LEDs init failed (err %d)", err);
 	}
 
 	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
