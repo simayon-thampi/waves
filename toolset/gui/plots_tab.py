@@ -7,7 +7,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.collections import PolyCollection
 from toolset.gui.cs_theme import _Theme
-from toolset.processing.cs_phase_slope import calculate_distance_from_phase_slope
+
 
 
 class PlotsTabMixin:
@@ -80,7 +80,11 @@ class PlotsTabMixin:
     def _update_plots_tab(self):
         self._update_phase_plot(self._current_phase_slope_data)
         self._update_amplitude_response_plot(self._current_amplitude_response_data)
-        distance = calculate_distance_from_phase_slope(self._current_phase_slope_data) if self._current_phase_slope_data else None
+        result = self._last_dsp_results.get("Phase Slope")
+        if result is not None:
+            distance = result.distance_m if not math.isnan(result.distance_m) else None
+        else:
+            distance = None
         if self._distance_text is not None:
             self._distance_text.set_text(f"Distance: {distance:.2f} m" if distance is not None else "Distance: N/A")
         self._render_plots()

@@ -2,6 +2,9 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/cs.h>
 #include <zephyr/console/console.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/regulator.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/reboot.h>
@@ -21,6 +24,12 @@ static K_SEM_DEFINE(sem_remote_capabilities_obtained, 0, 1);
 static K_SEM_DEFINE(sem_config_created, 0, 1);
 static K_SEM_DEFINE(sem_cs_security_enabled, 0, 1);
 static K_SEM_DEFINE(sem_connected, 0, 1);
+
+static const struct gpio_dt_spec rfswctl = GPIO_DT_SPEC_GET(
+    DT_NODELABEL(rfsw_ctl),
+    enable_gpios); // RF switch control pin GPIO2.5 (0 = onboard antenna)
+static const struct device *const rfsw_reg = DEVICE_DT_GET(DT_NODELABEL(
+    rfsw_pwr)); // RF switch power pin GPIO2.3 (1 = VDD to the switch)
 
 /* Separate thread to handle user input:
 - 's' to start firmware
@@ -317,6 +326,10 @@ int main(void) {
   LOG_INF("Starting Simple Channel Sounding Initiator Sample");
 
   dk_leds_init();
+
+  regulator_enable(rfsw_reg);
+
+  gpio_pin_set_dt(&rfswctl, 1);
 
   err = bt_enable(NULL);
   if (err) {

@@ -6,7 +6,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from toolset.gui.cs_theme import _Theme
-from toolset.processing.cs_music import compute_music_spectrum, calculate_distance_from_music
+
 
 
 class MusicTabMixin:
@@ -71,12 +71,12 @@ class MusicTabMixin:
 
     def _update_music_tab(self):
         delays_ns, pseudo_spectrum = None, None
-        if self._current_phase_slope_data and self._current_amplitude_response_data:
-            delays_ns, pseudo_spectrum = compute_music_spectrum(
-                self._current_phase_slope_data,
-                self._current_amplitude_response_data,
-            )
-        distance = calculate_distance_from_music(delays_ns, pseudo_spectrum) if delays_ns is not None else None
+        distance = None
+        result = self._last_dsp_results.get("MUSIC")
+        if result is not None:
+            delays_ns = result.diagnostics.get("delays_ns")
+            pseudo_spectrum = result.diagnostics.get("pseudo_spectrum")
+            distance = result.distance_m if not math.isnan(result.distance_m) else None
 
         if delays_ns is not None and len(delays_ns) > 0:
             x = delays_ns

@@ -3,12 +3,20 @@
 #include <zephyr/bluetooth/cs.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/console/console.h>
+#include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/regulator.h>
 #include <zephyr/kernel.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/types.h>
+
+static const struct gpio_dt_spec rfswctl = GPIO_DT_SPEC_GET(
+    DT_NODELABEL(rfsw_ctl),
+    enable_gpios); // RF switch control pin GPIO2.5 (0 = onboard antenna)
+static const struct device *const rfsw_reg = DEVICE_DT_GET(DT_NODELABEL(
+    rfsw_pwr)); // RF switch power pin GPIO2.3 (1 = VDD to the switch)
 
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
@@ -197,6 +205,10 @@ int main(void) {
   int err;
 
   LOG_INF("Starting Simple Channel Sounding Reflector Sample");
+
+  regulator_enable(rfsw_reg);
+
+  gpio_pin_set_dt(&rfswctl, 1);
 
   err = bt_enable(NULL);
   if (err) {

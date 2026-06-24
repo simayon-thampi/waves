@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 
 import argparse
-import os
 import signal
 import time
-from datetime import datetime
 from queue import Queue
 from threading import Thread, Event
 
 from toolset.data_sources import FileDataSource
 from toolset.data_sources.uart_source import UartDataSource
 from toolset.pipeline import producer_worker
+from toolset.pipeline.session_logger import SessionLogger
 from toolset.processing.cs_subevent_data_consumer import dual_stream_consumer
 from toolset.gui.cs_viewer import launch_viewer
+from toolset.estimators.phase_slope import PhaseSlopeEstimator
+from toolset.estimators.ifft import IFFTEstimator
+from toolset.estimators.music import MUSICEstimator
+from toolset.estimators.weighted_ls import WeightedLSEstimator
+from toolset.estimators.ema import EMAEstimator
+from toolset.pipeline.dsp_worker import DSPWorker
 
 
 def main():
@@ -41,7 +46,13 @@ def main():
     parser.add_argument(
         '--log-uart',
         action='store_true',
-        help='Write raw UART data to log files in log/ folder'
+        help='Write raw UART data to log/<timestamp>/ folder'
+    )
+
+    parser.add_argument(
+        '--log-session',
+        action='store_true',
+        help='Save all console output (stdout + stderr) to log/<timestamp>/session.log'
     )
 
     parser.add_argument(
@@ -95,23 +106,23 @@ def main():
     if args.ml_handler and not args.ml:
         parser.error("--ml-handler requires --ml")
 
+    # ------------------------------------------------------------------ #
+    # Session logger — always created; controls what gets written to disk  #
+    # ------------------------------------------------------------------ #
+    need_session_folder = args.log_uart or args.log_session
+    session_logger: SessionLogger | None = None
+
+    if need_session_folder:
+        session_logger = SessionLogger(
+            log_root='log',
+            enable_session_log=args.log_session,
+        )
+        print(f"Session folder: {session_logger.session_dir}")
+
     # Create separate queues for each stream
     initiator_queue = Queue(maxsize=100)
     reflector_queue = Queue(maxsize=100)
     stop_event = Event()
-
-    # Setup raw logging if requested
-    initiator_log_file = None
-    reflector_log_file = None
-    if args.log_uart:
-        log_dir = 'log'
-        os.makedirs(log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        initiator_log_file = os.path.join(log_dir, f'{timestamp}_initiator.txt')
-        reflector_log_file = os.path.join(log_dir, f'{timestamp}_reflector.txt')
-        print(f"Raw logging enabled:")
-        print(f"  Initiator: {initiator_log_file}")
-        print(f"  Reflector: {reflector_log_file}")
 
     if args.uart:
         print("Mode: Reading from COM-ports")
@@ -133,8 +144,12 @@ def main():
         reflector_source.flush_input()
         print("Buffers flushed.")
 
-        initiator_source.enable_logging(initiator_log_file)
-        reflector_source.enable_logging(reflector_log_file)
+        if args.log_uart and session_logger:
+            initiator_source.enable_logging(session_logger.initiator_log_path)
+            reflector_source.enable_logging(session_logger.reflector_log_path)
+            print(f"Raw logging enabled:")
+            print(f"  Initiator: {session_logger.initiator_log_path}")
+            print(f"  Reflector: {session_logger.reflector_log_path}")
 
         print("Sending start command to initiator...")
         initiator_source.send(b's')
@@ -144,13 +159,33 @@ def main():
         initiator_source = FileDataSource(args.initiator)
         reflector_source = FileDataSource(args.reflector)
 
+    # Initialize background DSP worker
+    _wls = WeightedLSEstimator()
+    dsp_worker = DSPWorker(
+        estimators=[
+            PhaseSlopeEstimator(),
+            IFFTEstimator(),
+            MUSICEstimator(),
+            _wls,
+            EMAEstimator(_wls, alpha=0.2),   # smoothed WLS — tune alpha as needed
+        ]
+    )
+
     def shutdown():
         """Signal all threads to stop and close open data sources."""
         stop_event.set()
         initiator_source.close()
         reflector_source.close()
+        dsp_worker.stop()
+        if session_logger:
+            session_logger.close()
 
     viewer = launch_viewer(dark_mode=args.dark_mode, ml=args.ml, ml_handler=args.ml_handler, on_close=shutdown)
+    viewer.set_dsp_queues(dsp_worker.input_queue, dsp_worker.output_queue)
+
+    # Wire session logger into the DSP drain so every result bundle is saved.
+    if session_logger:
+        viewer.set_session_logger(session_logger)
 
     def _sigint_handler(sig, frame):
         shutdown()
@@ -185,6 +220,7 @@ def main():
     )
 
     print("Starting data processing pipeline...")
+    dsp_worker.start()
     initiator_producer.start()
     reflector_producer.start()
     consumer.start()

@@ -1,3 +1,4 @@
+import math
 import tkinter as tk
 from tkinter import ttk
 from typing import Optional
@@ -5,7 +6,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from toolset.gui.cs_theme import _Theme
-from toolset.processing.cs_ifft import compute_ifft_response, calculate_distance_from_ifft
+
 
 class IFftTabMixin:
     """IFFT (impulse response) plot tab."""
@@ -70,18 +71,17 @@ class IFftTabMixin:
 
     def _update_ifft_tab(self):
         t_ns, magnitude = None, None
-        if self._current_phase_slope_data and self._current_amplitude_response_data:
-            t_ns, magnitude = compute_ifft_response(
-                self._current_phase_slope_data,
-                self._current_amplitude_response_data,
-            )
-        distance = calculate_distance_from_ifft(t_ns, magnitude) if t_ns is not None else None
+        distance = None
+        result = self._last_dsp_results.get("IFFT")
+        if result is not None:
+            t_ns = result.diagnostics.get("t_ns")
+            magnitude = result.diagnostics.get("magnitude")
+            distance = result.distance_m if not math.isnan(result.distance_m) else None
 
         if t_ns is not None and len(t_ns) > 0:
-            # Show only first half – covers the unambiguous range (0 to 1/(2*f_step) ≈ 500 ns)
-            half = len(t_ns) // 2
-            x = t_ns[:half]
-            y = magnitude[:half]
+            # compute_ifft_response already clips to [0, 500 ns] — use the full array.
+            x = t_ns
+            y = magnitude
             self._ifft_line.set_data(x, y)
             t_ns_peak = float(x[np.argmax(y)]) if len(y) else 0.0
             self._ifft_peak_vline.set_xdata([t_ns_peak, t_ns_peak])

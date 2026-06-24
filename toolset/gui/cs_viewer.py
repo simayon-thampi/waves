@@ -1,7 +1,11 @@
+import math
+import queue
 import tkinter as tk
 from tkinter import ttk
 from typing import List, Optional, Callable, Dict
+import numpy as np
 from toolset.cs_utils.cs_subevent import SubeventResults
+from toolset.estimators.base import EstimatorResult
 from toolset.gui.cs_theme import _Theme, LIGHT_THEME, DARK_THEME
 from toolset.gui.setup_tab import SetupTabMixin
 from toolset.gui.steps_tab import StepsTabMixin
@@ -10,12 +14,56 @@ from toolset.gui.ifft_tab import IFftTabMixin
 from toolset.gui.music_tab import MusicTabMixin
 from toolset.gui.ml_tab import MLTabMixin
 from toolset.processing.ml_handler import load_ml_handler
+from toolset.processing.channel_response import ChannelResponse, Role
 from matplotlib.collections import PolyCollection
 
-# Skip a render when this many subevents have accumulated since the last rendered
-# one. Prevents back-to-back renders (which starve the mainloop) when a slow
-# tab (e.g. MUSIC eigendecomposition) takes longer than gui_refresh_interval_ms.
-_LAG_SKIP_COUNT = 3
+# _LAG_SKIP_COUNT: skip a render when this many subevents have accumulated.
+#
+# Original value was 3 to compensate for estimators (Phase Slope, IFFT, MUSIC)
+# running on the Tk main thread and blocking the event loop.  Now that all
+# estimators run in the DSPWorker daemon thread, the GUI render itself is very
+# cheap (just blitting pre-computed results), so the guard is reduced to 1.
+# It still protects against data-source bursts (e.g. a log file replayed at
+# full speed) where the live counter advances faster than 100 ms per frame.
+_LAG_SKIP_COUNT = 1
+
+
+def _cr_from_dicts(
+    phase_slope_data: Optional[Dict[int, float]],
+    amplitude_response_data: Optional[Dict[int, float]],
+    procedure_counter: int = 0,
+) -> Optional[ChannelResponse]:
+    """
+    Build a minimal ChannelResponse from the legacy phase/amplitude dicts.
+
+    Used exclusively inside ``CSViewer._update_display()`` so that
+    estimator adapters receive a ChannelResponse rather than raw dicts.
+    Returns ``None`` when either input dict is absent or empty.
+    """
+    if not phase_slope_data or not amplitude_response_data:
+        return None
+
+    common = sorted(set(phase_slope_data) & set(amplitude_response_data))
+    if not common:
+        return None
+
+    channels = np.array(common, dtype=np.int32)
+    phase_rad = np.array([phase_slope_data[ch] for ch in common], dtype=np.float32)
+    amplitude_db = np.array([amplitude_response_data[ch] for ch in common], dtype=np.float32)
+    n = len(common)
+    # IQ is not meaningful here – fill with unit phasors consistent with phase_rad
+    iq_per_path = np.exp(1j * phase_rad.astype(np.float64)).astype(np.complex64)[:, np.newaxis]
+
+    return ChannelResponse(
+        channels=channels,
+        iq_per_path=iq_per_path,
+        amplitude_db=amplitude_db,
+        phase_rad=phase_rad,
+        quality_flags=np.zeros(n, dtype=np.uint8),
+        procedure_counter=procedure_counter,
+        role=Role.COMBINED,
+        timestamp=0.0,
+    )
 
 
 class CSViewer(SetupTabMixin, StepsTabMixin, PlotsTabMixin, IFftTabMixin, MusicTabMixin, MLTabMixin):
@@ -45,6 +93,7 @@ class CSViewer(SetupTabMixin, StepsTabMixin, PlotsTabMixin, IFftTabMixin, MusicT
         self._current_reflector: Optional[SubeventResults] = None
         self._current_phase_slope_data: Optional[Dict[int, float]] = None
         self._current_amplitude_response_data: Optional[Dict[int, float]] = None
+        self._current_channel_response: Optional[ChannelResponse] = None
         self._tab_update_handlers: Dict[str, Callable[[], None]] = {}
         self._tab_indices: Dict[str, int] = {}
         self._active_tab_key: Optional[str] = None
@@ -61,6 +110,21 @@ class CSViewer(SetupTabMixin, StepsTabMixin, PlotsTabMixin, IFftTabMixin, MusicT
         self._rssi_bottom_dbm = -100.0
         self._rssi_top_dbm = 0.0
         self._bar_width = 0.35
+
+        # DSP offload queues — connected by run.py via set_dsp_queues().
+        # _dsp_input_queue  : ChannelResponse → DSPWorker
+        # _dsp_output_queue : (procedure_counter, List[EstimatorResult]) → GUI drain
+        self._dsp_input_queue:  Optional[queue.Queue] = None
+        self._dsp_output_queue: Optional[queue.Queue] = None
+
+        # Last successfully received DSP results, keyed by estimator_name.
+        # Tabs read from this cache so they always show the most-recent value
+        # even when the worker is slower than the frame rate.
+        self._last_dsp_results: Dict[str, EstimatorResult] = {}
+        self._pipeline_inspector = None
+
+        # Optional session logger — set by run.py via set_session_logger().
+        self._session_logger = None
 
         # Capabilities description state
         self._capabilities_labels: List[str] = []
@@ -136,6 +200,13 @@ class CSViewer(SetupTabMixin, StepsTabMixin, PlotsTabMixin, IFftTabMixin, MusicT
 
     def _create_widgets(self, procedure_counters: List[int]):
         """Create GUI widgets"""
+
+        # Tools Menu
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Pipeline Inspector", command=self._open_pipeline_inspector)
 
         main_frame = ttk.Frame(self.root, padding="20")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -253,6 +324,26 @@ class CSViewer(SetupTabMixin, StepsTabMixin, PlotsTabMixin, IFftTabMixin, MusicT
                 self._current_phase_slope_data = self.phase_slope_map.get(counter_value)
                 self._current_amplitude_response_data = self.amplitude_response_map.get(counter_value)
 
+            # Build a ChannelResponse from the current dict data.
+            # Pass the real procedure_counter so the DSP worker (and the
+            # session logger) always record which procedure was processed.
+            self._current_channel_response = _cr_from_dicts(
+                self._current_phase_slope_data,
+                self._current_amplitude_response_data,
+                procedure_counter=self._current_counter or 0,
+            )
+
+            # Push to DSP worker (non-blocking; worker drains backlog itself).
+            if self._current_channel_response is not None and self._dsp_input_queue is not None:
+                self._dsp_input_queue.put(self._current_channel_response)
+
+            # Feed raw ChannelResponse into Pipeline Inspector dashboard if open
+            if self._current_channel_response is not None and self._pipeline_inspector is not None and self._pipeline_inspector.winfo_exists():
+                self._pipeline_inspector.add_raw_channel_response(
+                    self._current_channel_response,
+                    self._current_initiator
+                )
+
             self._update_current_tab_content()
 
         except Exception as e:
@@ -285,7 +376,11 @@ class CSViewer(SetupTabMixin, StepsTabMixin, PlotsTabMixin, IFftTabMixin, MusicT
 
             all_counters = sorted(set(self.initiator_map.keys()) | set(self.reflector_map.keys()))
             if all_counters:
-                self.counter_spinbox.config(from_=min(all_counters), to=max(all_counters))
+                try:
+                    if hasattr(self, "counter_spinbox") and self.counter_spinbox.winfo_exists():
+                        self.counter_spinbox.config(from_=min(all_counters), to=max(all_counters))
+                except Exception:
+                    pass
 
             if self.live_mode:
                 self._pending_live_counter = initiator.procedure_counter
@@ -310,23 +405,74 @@ class CSViewer(SetupTabMixin, StepsTabMixin, PlotsTabMixin, IFftTabMixin, MusicT
 
         lag = (counter - self._last_rendered_counter) if self._last_rendered_counter is not None else 0
         if lag > _LAG_SKIP_COUNT:
-            # Too many subevents queued up. Advance the reference so the next
-            # flush renders the latest data instead of an already-stale frame.
-            self._last_rendered_counter = counter
-            self._live_render_scheduled = True
-            self.root.after(self.gui_refresh_interval_ms, self._flush_live_render)
-            print(f"GUI dropped {lag} frames to catch up with live data (counter={counter})")
-            return
+            # Skip stale intermediate renders, but proceed to draw the latest frame immediately
+            # rather than postponing or skipping the rendering step entirely.
+            pass
 
         self._last_rendered_counter = counter
         self.counter_var.set(counter)
         self._update_display()
+
+    def set_dsp_queues(self, input_queue: queue.Queue, output_queue: queue.Queue) -> None:
+        """Connect the background DSP worker queues to the viewer and start polling."""
+        self._dsp_input_queue = input_queue
+        self._dsp_output_queue = output_queue
+        self.root.after(0, self._drain_dsp_queue)
+
+    def set_session_logger(self, session_logger) -> None:
+        """Attach a :class:`~toolset.pipeline.session_logger.SessionLogger` so
+        every DSP result bundle is written to ``distances.csv``."""
+        self._session_logger = session_logger
+
+    def _drain_dsp_queue(self) -> None:
+        """
+        Periodically drain the DSP output queue on the Tk main thread.
+        Updates self._last_dsp_results and triggers a redraw of the active tab.
+        Also forwards each result bundle to the session logger (if attached).
+        """
+        if self._dsp_output_queue is None:
+            return
+
+        has_new = False
+        while True:
+            try:
+                # Output queue now carries (procedure_counter, results) so the
+                # logged counter is the one that was actually processed by the
+                # worker, not the GUI's current display counter at drain time.
+                proc_counter, results = self._dsp_output_queue.get_nowait()
+                for result in results:
+                    self._last_dsp_results[result.estimator_name] = result
+                if self._session_logger is not None:
+                    self._session_logger.log_dsp_results(proc_counter, results)
+                has_new = True
+            except queue.Empty:
+                break
+
+        if has_new:
+            self._update_current_tab_content()
+
+        # Schedule the next poll. 10 ms keeps UI extremely responsive
+        self.root.after(10, self._drain_dsp_queue)
 
     def _set_text_widget(self, widget: tk.Text, value: str):
         widget.config(state=tk.NORMAL)
         widget.delete('1.0', tk.END)
         widget.insert(tk.END, value)
         widget.config(state=tk.DISABLED)
+
+    def _open_pipeline_inspector(self):
+        """Open the Pipeline Stage Inspector dashboard window."""
+        from toolset.gui.inspection_dashboard import PipelineInspectorDashboard
+        if self._pipeline_inspector is not None and self._pipeline_inspector.winfo_exists():
+            self._pipeline_inspector.lift()
+        else:
+            self._pipeline_inspector = PipelineInspectorDashboard(self)
+            # Seed the dashboard with current active response if available
+            if self._current_channel_response is not None:
+                self._pipeline_inspector.add_raw_channel_response(
+                    self._current_channel_response,
+                    self._current_initiator
+                )
 
     def _handle_close(self):
         """Called when the window's close button is pressed."""
